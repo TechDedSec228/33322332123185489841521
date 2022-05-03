@@ -1,0 +1,478 @@
+ModelType lldpCalculator()
+{
+    static List(Pair(String, String)) replacePort = List(Pair(String, String))
+    [
+        Pair(String, String)["port ", ""]        
+    ];
+    static Map(String, String) portNameMap = Map(String, String)
+    [
+        "Gi" : "Gigabitethernet",
+        "Te" : "TenGigE",
+        "Fa" : "FastEthernet"
+    ];
+
+    Method proceedRemotePortRecord
+    (
+        ODInstance &remotePortRecord,
+        IndexedMultiMap(UUID, Address) &deviceAddrs, // IndexedMultiMap(hash128(deviceId OR deviceSysName, deviceIdSubtype), modelAddr)
+        // Map(hash128(Set(firstModelAddr, secondModelAddr)), Pair(Pair(firstModelAddr, Map(lldpRemotePortId, firstId)), Pair(secondModelAddr, Map(lldpRemotePortId, secondId))))
+        Map(UUID, Pair(Pair(Address, Map(String, String)), Pair(Address, Map(String, String)))) &rawLinksData,
+        Set(Address) &modelsToCheck,
+        Boolean &linkModels,
+        Boolean &printLog
+    )
+    {
+        Integer locPortIdSubtype;
+        String locPortId;
+
+        Integer remPortIdSubtype;
+        String remPortId;
+        Integer remChassisIdSubtype;
+        String remChassisId;
+        String remSysName;
+
+        UUID remPortUuid;
+        UUID initRemPortUuid;
+        Pair(Integer, Integer) range;
+        Integer index;
+
+        ModelType mt;
+        String mn;
+        Boolean exist;
+
+        Address firstModelAddr;
+        ModelInstance firstModel;
+        String firstId;
+        Boolean firstIdSuccess;
+        Address secondModelAddr;
+        ModelInstance secondModel;
+        String secondId;
+        Boolean success;
+        String cId;
+
+        // Get remote port info
+        remotePortRecord->getVariableValue(name = "remChassisIdSubtype", value = &remChassisIdSubtype);
+        remotePortRecord->getVariableValue(name = "remChassisId", value = &remChassisId);
+        remotePortRecord->getVariableValue(name = "remSysName", value = &remSysName);
+        @constants::removeSpaces(string = &remSysName);
+        remotePortRecord->getVariableValue(name = "remPortIdSubtype", value = &remPortIdSubtype);
+        remotePortRecord->getVariableValue(name = "remPortId", value = &remPortId);
+
+        if (printLog)
+        {
+            log(INFO)(format = "\c37m\t(LLDP) Remote chassis id subtype %rcs%, remote chassis id \"%rc%\", remote system name \"%rn%\", remote port id subtype %ps%, remote port id \"%pi%\"\d",
+                    rcs = &remChassisIdSubtype, rc = &remChassisId, rn = &remSysName, ps = &remPortIdSubtype, pi = &remPortId);
+        }
+
+        // Searching this port among local ports
+        success = false;
+        if (remChassisIdSubtype != 0)
+        {
+            initRemPortUuid = hash128(&remChassisIdSubtype);
+            if (remChassisId != "")
+            {
+                remPortUuid = hash128(&remChassisId, &initRemPortUuid);
+                if (deviceAddrs contains remPortUuid)
+                {
+                    success = true;
+                }
+                else
+                {
+                    if (remSysName != "")
+                    {
+                        remPortUuid = hash128(&remSysName, &initRemPortUuid);
+                        if (deviceAddrs contains remPortUuid)
+                        {
+                            success = true;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if (remSysName != "")
+                {
+                    remPortUuid = hash128(&remSysName, &initRemPortUuid);
+                    if (deviceAddrs contains remPortUuid)
+                    {
+                        success = true;
+                    }
+                }
+            }
+        }
+
+        if (success)
+        {
+            remotePortRecord->getVariableValue(name = "modelAddr", value = &firstModelAddr);
+            @System::getHandlerParameters(address = &firstModelAddr, modelType = &mt, methodName = &mn, modelInstance = &firstModel, success = &exist);
+            if (exist)
+            {
+                if (printLog)
+                {
+                    log(INFO)(format = "\c35m(LLDP) Local model exists: %a%\d", a = &firstModelAddr);
+                }
+
+                remotePortRecord->getVariableValue(name = "id", value = &cId);
+                ReadLock sLock = ReadLock[firstModel.storageMutex];
+                    if ((firstModel.componentStorage contains "lldpLocalPort") AND (firstModel.componentStorage["lldpLocalPort"] contains cId))
+                    {
+                        // Get interface id from found model in local records
+                        ODInstance &localPortRecord = &firstModel.componentStorage["lldpLocalPort"][cId];
+                        localPortRecord->getVariableValue(name = "locPortIdSubtype", value = &locPortIdSubtype);
+                        localPortRecord->getVariableValue(name = "locPortId", value = &locPortId);
+                        ::getIfIndex(portIdSubtype = &locPortIdSubtype, port = &locPortId, ifIndex = &firstId, success = &firstIdSuccess,
+                                model = &firstModel);
+                    }
+                sLock.unlock();
+
+                range = deviceAddrs->getIndexRange(remPortUuid);
+                for (index = range.first; index < range.first + range.second; index += 1)
+                {
+                    secondModelAddr = deviceAddrs{index};
+                    if ((firstModelAddr != secondModelAddr) AND ((modelsToCheck contains firstModelAddr) OR (modelsToCheck contains secondModelAddr)))
+                    {
+                        @System::getHandlerParameters(address = &secondModelAddr, modelType = &mt, methodName = &mn, modelInstance = &secondModel, success = &exist);
+                        if (exist)
+                        {
+                            if (printLog)
+                            {
+                                log(INFO)(format = "\c37m\t(LLDP) Remote model exists: %s%, remote port id subtype %rps%, remote port id \"%rpi%\"\d",
+                                        s = &secondModelAddr, rps = &remPortIdSubtype, rpi = &remPortId);
+                            }
+
+                            // Get interface id from found model in remote records
+                            ::getIfIndex(portIdSubtype = &remPortIdSubtype, port = &remPortId, ifIndex = &secondId, success = &success,
+                                    model = &secondModel);
+                            if (success)
+                            {
+                                if (printLog)
+                                {
+                                    log(INFO)(format = "\c37m\t(LLDP) Remote port with id \"%i%\" found\d", i = &secondId);
+                                }
+
+                                if (firstIdSuccess)
+                                {
+                                    ::insertIdsToRawLinksData
+                                    (
+                                        rawLinksData = &rawLinksData,
+                                        firstModelAddr = &firstModelAddr,
+                                        firstId = &firstId,
+                                        secondModelAddr = &secondModelAddr,
+                                        secondId = &secondId
+                                    );
+                                }
+                                else
+                                {
+                                    if (linkModels)
+                                    {
+                                        ::insertIdsToRawLinksData
+                                        (
+                                            rawLinksData = &rawLinksData,
+                                            firstModelAddr = &firstModelAddr,
+                                            firstId = "attributes",
+                                            secondModelAddr = &secondModelAddr,
+                                            secondId = &secondId
+                                        );
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                if (firstIdSuccess AND linkModels)
+                                {
+                                    ::insertIdsToRawLinksData
+                                    (
+                                        rawLinksData = &rawLinksData,
+                                        firstModelAddr = &firstModelAddr,
+                                        firstId = &firstId,
+                                        secondModelAddr = &secondModelAddr,
+                                        secondId = "attributes"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Method insertIdsToRawLinksData
+    (
+        Map(UUID, Pair(Pair(Address, Map(String, String)), Pair(Address, Map(String, String)))) &rawLinksData,
+        Address &firstModelAddr,
+        String &firstId,
+        Address &secondModelAddr,
+        String &secondId
+    ) {
+        Set(Address) modelsPair = Set(Address)[firstModelAddr, secondModelAddr];
+        UUID linkUuid = hash128(&modelsPair);
+        if (rawLinksData contains linkUuid)
+        {
+            Pair(Pair(Address, Map(String, String)), Pair(Address, Map(String, String))) &rawLinkData = &rawLinksData[linkUuid];
+            if (secondModelAddr == rawLinkData.first.first)
+            {
+                rawLinkData.first.second->updateElement(secondId)[firstId];
+            }
+            else
+            {
+                if (secondModelAddr == rawLinkData.second.first)
+                {
+                    rawLinkData.second.second->updateElement(secondId)[firstId];
+                }
+            }
+        }
+        else
+        {
+            rawLinksData->insertElement(Pair(Pair(Address, Map(String, String)), Pair(Address, Map(String, String)))
+            [
+                Pair(Address, Map(String, String))[firstModelAddr, Map(String, String)[]],
+                Pair(Address, Map(String, String))[secondModelAddr, Map(String, String)[firstId : secondId]]
+            ])[linkUuid];
+        }
+    }
+
+    Method portWordClear(String &port)
+    {
+        Integer i = port->find(0, "port ");
+        if (i != -1)
+        {
+            port->replace(replacePort);
+        }
+    }
+
+    Method getIfIndex(Integer &portIdSubtype, String &port, String &ifIndex, Boolean &success, ModelInstance &model)
+    {
+        success = false;
+        @constants::removeZeros(string = &port);
+        switch (portIdSubtype)
+        {
+            case (7)
+            {
+                ::subtype3or7(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                break;
+            }
+            case (3)
+            {
+                ::subtype3or7(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                break;
+            }
+            case (5)
+            {
+                ::subtype5(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                if (success)
+                {
+                    break;
+                }
+                ::subtype2(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                if (success)
+                {
+                    break;
+                }
+                ::subtype1(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                break;
+            }
+            case (1)
+            {
+                ::subtype1(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                if (success)
+                {
+                    break;
+                }
+                ::subtype5(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                if (success)
+                {
+                    break;
+                }
+                ::subtype2(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                break;
+            }
+            case (2)
+            {
+                ::subtype2(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                if (success)
+                {
+                    break;
+                }
+                ::subtype5(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                if (success)
+                {
+                    break;
+                }
+                ::subtype1(port = &port, ifIndex = &ifIndex, success = &success, model = &model);
+                break;
+            }
+        }
+    }
+
+    Method subtype3or7(String &port, String &ifIndex, Boolean &success, ModelInstance &model)
+    {
+        // macAddress or local
+        success = false;
+
+        String id;
+        ODInstance record;
+        String locPortId;
+        model.storageMutex->readLock;
+            foreach (id in model.componentStorage["lldpLocalPort"])
+            {
+                record = model.componentStorage["lldpLocalPort"][id];
+                record->getVariableValue(name = "locPortId", value = &locPortId);
+                if (locPortId == port)
+                {
+                    record->getVariableValue(name = "id", value = &ifIndex);
+                    if (model.componentStorage["interface"] contains ifIndex)
+                    {
+                        success = true;
+                        break;
+                    }
+                }
+            }
+        model.storageMutex->unlock;
+    }
+
+    /*Method subtype3(String &port, String &ifIndex, Boolean &success, ModelInstance &model)
+    {
+        // macAddress
+        success = false;
+
+        String id;
+        ODInstance record;
+        String phyAddr;
+        model.storageMutex->readLock;
+            foreach (id in model.componentStorage["interface"])
+            {
+                record = model.componentStorage["interface"][id];
+                record->getVariableValue(name = "phyAddr", value = &phyAddr);
+                if (phyAddr == port)
+                {
+                    success = true;
+                    record->getVariableValue(name = "id", value = &ifIndex);
+                    break;
+                }
+            }
+        model.storageMutex->unlock;
+    }*/
+
+    Method subtype1(String &port, String &ifIndex, Boolean &success, ModelInstance &model)
+    {
+        // ifAlias
+        success = false;
+        //@constants::removeSpaces(string = &port);
+
+        String id;
+        ODInstance record;
+        String ifAlias;
+        model.storageMutex->readLock;
+            foreach (id in model.componentStorage["interface"])
+            {
+                record = model.componentStorage["interface"][id];
+                record->getVariableValue(name = "ifAlias", value = &ifAlias);
+                //@constants::removeSpaces(string = &ifAlias);
+                //@cdpCalculator::comparePortStringWithCache(portString = &ifAlias, cacheDevicePort = &port, success = &success);
+                //if (success)
+                if (ifAlias == port)
+                {
+                    success = true;
+                    record->getVariableValue(name = "id", value = &ifIndex);
+                    break;
+                }
+            }
+        model.storageMutex->unlock;
+    }
+
+    Method subtype5(String &port, String &ifIndex, Boolean &success, ModelInstance &model)
+    {
+        // ifName or interfaceDescription
+        success = false;
+        //@constants::removeSpaces(string = &port);
+
+        String id;
+        ODInstance record;
+        String ifName;
+        String ifDescription;
+        Boolean successName;
+        Boolean successDescr;
+        model.storageMutex->readLock;
+            foreach (id in model.componentStorage["interface"])
+            {
+                record = model.componentStorage["interface"][id];
+                record->getVariableValue(name = "name", value = &ifName);
+                //@constants::removeSpaces(string = &ifName);
+                //@cdpCalculator::comparePortStringWithCache(portString = &ifName, cacheDevicePort = &port, success = &successName);
+
+                record->getVariableValue(name = "description", value = &ifDescription);
+                //@constants::removeSpaces(string = &ifDescription);
+                //@cdpCalculator::comparePortStringWithCache(portString = &ifDescription, cacheDevicePort = &port, success = &successDescr);
+                //if (successName OR successDescr)
+                if ((ifName == port) OR (ifDescription == port))
+                {
+                    success = true;
+                    ifIndex = id;
+                    break;
+                }
+            }
+        model.storageMutex->unlock;
+    }
+
+    Method subtype2(String &port, String &ifIndex, Boolean &success, ModelInstance &model)
+    {
+        // portComponent тоже что и subtype5, но ищем со словом port и без слова port
+        success = false;
+
+        String portClear = port;
+        ::portWordClear(port = &portClear);
+        //@constants::removeSpaces(string = &port);
+        //@constants::removeSpaces(string = &portClear);
+
+        String id;
+        ODInstance record;
+        String ifName;
+        String ifDescription;
+        Boolean successName;
+        Boolean successDescr;
+        Boolean successNameClear;
+        Boolean successDescrClear;
+        model.storageMutex->readLock;
+            foreach (id in model.componentStorage["interface"])
+            {
+                record = model.componentStorage["interface"][id];
+                record->getVariableValue(name = "name", value = &ifName);
+                //@constants::removeSpaces(string = &ifName);
+                //@cdpCalculator::comparePortStringWithCache(portString = &ifName, cacheDevicePort = &port, success = &successName);
+                //@cdpCalculator::comparePortStringWithCache(portString = &ifName, cacheDevicePort = &portClear, success = &successNameClear);
+
+                record->getVariableValue(name = "description", value = &ifDescription);
+                //@constants::removeSpaces(string = &ifDescription);
+                //@cdpCalculator::comparePortStringWithCache(portString = &ifDescription, cacheDevicePort = &port, success = &successDescr);
+                //@cdpCalculator::comparePortStringWithCache(portString = &ifDescription, cacheDevicePort = &portClear, success = &successDescrClear);
+                //if (successName OR successDescr OR successNameClear OR successDescrClear)
+                if ((ifName == port) OR (ifDescription == port) OR (ifName == portClear) OR (ifDescription == portClear))
+                {
+                    success = true;
+                    ifIndex = id;
+                    break;
+                }
+                else
+                {
+                    PCRE pcre;
+                    pcre.compile("(\\D+)([0-9\\/]+)")
+                    Deque(String) matched = pcre.exec(port, true);
+                    if((sizeOf(matched) > 2) AND (sizeOf(matched[1]) > 0) AND (sizeOf(matched[2]) > 0))
+                    {
+                        if(portNameMap contains matched[1])
+                        {
+                            String portName = portNameMap[matched[1]] + matched[2];
+                            if ((ifName == portName) OR (ifDescription == portName))
+                            {
+                                success = true;
+                                ifIndex = id;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        model.storageMutex->unlock;
+    }
+}
